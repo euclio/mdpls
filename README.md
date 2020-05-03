@@ -16,6 +16,8 @@ mdpls requires stable Rust, which can easily be installed and updated via
 cargo install --git https://github.com/euclio/mpdls
 ```
 
+The `mdpls` binary will be installed to `.cargo/bin` in your home directory.
+
 ### Usage
 
 mdpls works with your [favorite editor's LSP plugin][lsp-tools]. Consult
