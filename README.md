@@ -13,7 +13,7 @@ mdpls requires stable Rust, which can easily be installed and updated via
 [rustup].
 
 ```sh
-cargo install --git https://github.com/euclio/mpdls
+cargo install --git https://github.com/euclio/mdpls
 ```
 
 The `mdpls` binary will be installed to `.cargo/bin` in your home directory.
