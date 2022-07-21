@@ -33,6 +33,12 @@ struct Settings {
 
     /// highlight.js style to use for syntax highlighting in code blocks.
     theme: String,
+
+    /// Serve static files like images. This should only be use with trusted documents.
+    serve_static: bool,
+
+    /// Program and arguments to use to render the markdown. If `None`, use the default renderer.
+    renderer: Option<(String, Vec<String>)>,
 }
 
 impl Default for Settings {
@@ -41,6 +47,8 @@ impl Default for Settings {
             auto: true,
             browser: None,
             theme: String::from("github"),
+            serve_static: false,
+            renderer: None,
         }
     }
 }
@@ -68,6 +76,10 @@ impl<'de> Deserialize<'de> for Settings {
             #[serde(default)]
             browser: Option<(String, Vec<String>)>,
             code_theme: Option<String>,
+            serve_static: Option<bool>,
+            #[serde(deserialize_with = "deserialize_opt_command")]
+            #[serde(default)]
+            renderer: Option<(String, Vec<String>)>,
         }
 
         Settings::deserialize(deserializer).map(|settings| {
@@ -85,17 +97,17 @@ impl<'de> Deserialize<'de> for Settings {
                 }
 
                 settings.browser = preview_settings.browser;
+
+                if let Some(serve_static) = preview_settings.serve_static {
+                    settings.serve_static = serve_static;
+                }
+
+                settings.renderer = preview_settings.renderer;
             }
 
             settings
         })
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct Markdown {
-    auto: Option<bool>,
-    browser: Option<(String, Vec<String>)>,
 }
 
 pub struct Server<R, W> {
@@ -254,6 +266,18 @@ where
 
                     self.markdown_server
                         .set_highlight_theme(self.settings.theme.clone());
+
+                    // There is currently no way to unset the static root wihout restarting the browser
+                    if self.settings.serve_static {
+                        self.markdown_server
+                            .set_static_root(std::env::current_dir().unwrap())
+                    }
+
+                    if let Some(renderer) = &self.settings.renderer {
+                        let mut command = Command::new(&renderer.0);
+                        command.args(&renderer.1);
+                        self.markdown_server.set_external_renderer(command)
+                    }
                 }
             }
             <lsp_notification!("textDocument/didOpen")>::METHOD => {

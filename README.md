@@ -33,6 +33,8 @@ Like most language servers, mdpls operates over stdin and stdout.
 | `markdown.preview.auto` | boolean | Open the markdown preview automatically. | `true`
 | `markdown.preview.browser` | array or string | The program and arguments to use for opening the preview window. If not specified, the user's default browser will be used. The preview URL will be appended to this program as an argument. | None
 | `markdown.preview.codeTheme` | string | [highlight.js style] to use for syntax highlighting in code blocks. | `github`
+| `markdown.preview.serveStatic` | boolean | Serve static files like images (this should only be use with trusted documents) | `false`
+| `markdown.preview.renderer` | array or string | The program to use to render the markdown to html. If not specified, the builtin markdown renderer will be used. | None
 
 ### Commands
 
