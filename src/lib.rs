@@ -1,7 +1,9 @@
 use std::default::Default;
-use std::fmt;
 use std::io::{self, prelude::*};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use std::{fmt, thread};
 
 use log::*;
 use lsp_types::notification::Notification as LspNotification;
@@ -39,6 +41,12 @@ struct Settings {
 
     /// Program and arguments to use to render the markdown. If `None`, use the default renderer.
     renderer: Option<(String, Vec<String>)>,
+
+    /// If `Some`, don't update every time the document is changed.
+    /// `Some((ms_before, ms_between))`:
+    /// - After the first change, wait for `ms_before` milliseconds.
+    /// - Between two updates, wait at least `ms_between` milliseconds.
+    defer_updates: Option<(u64, u64)>,
 }
 
 impl Default for Settings {
@@ -49,6 +57,7 @@ impl Default for Settings {
             theme: String::from("github"),
             serve_static: false,
             renderer: None,
+            defer_updates: None,
         }
     }
 }
@@ -68,6 +77,12 @@ impl<'de> Deserialize<'de> for Settings {
             preview: Option<Preview>,
         }
 
+        #[derive(Deserialize, Default)]
+        struct DeferUpdates {
+            ms_before: u64,
+            ms_between: u64,
+        }
+
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Preview {
@@ -80,6 +95,8 @@ impl<'de> Deserialize<'de> for Settings {
             #[serde(deserialize_with = "deserialize_opt_command")]
             #[serde(default)]
             renderer: Option<(String, Vec<String>)>,
+            #[serde(default)]
+            defer_updates: DeferUpdates,
         }
 
         Settings::deserialize(deserializer).map(|settings| {
@@ -103,6 +120,18 @@ impl<'de> Deserialize<'de> for Settings {
                 }
 
                 settings.renderer = preview_settings.renderer;
+
+                settings.defer_updates = if preview_settings.defer_updates.ms_before > 0
+                    || preview_settings.defer_updates.ms_between > 0
+                {
+                    Some((
+                        preview_settings.defer_updates.ms_before,
+                        preview_settings.defer_updates.ms_between,
+                    ))
+                } else {
+                    // when `(0, 0)` (Default), don't spawn a thread.
+                    None
+                };
             }
 
             settings
@@ -114,7 +143,12 @@ pub struct Server<R, W> {
     transport: LspTransport<R, W>,
     settings: Settings,
     shutdown: bool,
-    markdown_server: aurelius::Server,
+    markdown_server: Arc<Mutex<aurelius::Server>>,
+    defer_control: Option<(
+        Arc<Mutex<Option<String>>>,
+        std::sync::mpsc::Sender<DeferEvent>,
+        thread::JoinHandle<()>,
+    )>,
     /// True if the server is being run as part of a test. The preview will not be spawned.
     #[doc(hidden)]
     pub test: bool,
@@ -138,12 +172,14 @@ where
             transport: LspTransport::new(reader, writer),
             settings,
             shutdown: false,
-            markdown_server: server,
+            markdown_server: Arc::new(Mutex::new(server)),
             test: false,
+            defer_control: None,
         }
     }
 
     pub fn serve(mut self) -> io::Result<()> {
+        self.spawn_or_stop_deferred_update_thread();
         loop {
             let message = match self.transport.decode() {
                 Ok(Some(message)) => message,
@@ -179,7 +215,17 @@ where
                 {
                     return Ok(())
                 }
-                Message::Notification(not) => self.handle_notification(not),
+                Message::Notification(not) => {
+                    if let Some(new_doc) = self.handle_notification(not) {
+                        if let Some((current_document, wake_thread, _)) = &self.defer_control {
+                            *current_document.lock().unwrap() = Some(new_doc);
+                            wake_thread.send(DeferEvent::UpdatePreview).unwrap();
+                        } else {
+                            // update the server directly
+                            self.markdown_server.lock().unwrap().send(new_doc).unwrap();
+                        }
+                    }
+                }
                 Message::Response(res) => unimplemented!("unhandled response: {:?}", res),
             }
         }
@@ -244,7 +290,7 @@ where
         }
     }
 
-    fn handle_notification(&mut self, not: Notification) {
+    fn handle_notification(&mut self, not: Notification) -> Option<String> {
         match not.method.as_str() {
             <lsp_notification!("workspace/didChangeConfiguration")>::METHOD => {
                 let params = <lsp_notification!("workspace/didChangeConfiguration") as LspNotification>::Params::deserialize(
@@ -256,7 +302,14 @@ where
 
                     let old_auto_setting = self.settings.auto;
 
+                    let update_thread = self.settings.defer_updates != settings.defer_updates;
+
                     self.settings = settings;
+
+                    if update_thread {
+                        // start/stop a thread and/or update its time settings
+                        self.spawn_or_stop_deferred_update_thread();
+                    }
 
                     if self.settings.auto && !old_auto_setting {
                         if let Err(e) = self.open_preview() {
@@ -265,18 +318,25 @@ where
                     }
 
                     self.markdown_server
+                        .lock()
+                        .unwrap()
                         .set_highlight_theme(self.settings.theme.clone());
 
                     // There is currently no way to unset the static root wihout restarting the browser
                     if self.settings.serve_static {
                         self.markdown_server
+                            .lock()
+                            .unwrap()
                             .set_static_root(std::env::current_dir().unwrap())
                     }
 
                     if let Some(renderer) = &self.settings.renderer {
                         let mut command = Command::new(&renderer.0);
                         command.args(&renderer.1);
-                        self.markdown_server.set_external_renderer(command)
+                        self.markdown_server
+                            .lock()
+                            .unwrap()
+                            .set_external_renderer(command)
                     }
                 }
             }
@@ -288,6 +348,8 @@ where
                     .unwrap();
 
                 self.markdown_server
+                    .lock()
+                    .unwrap()
                     .send(params.text_document.text)
                     .unwrap();
             }
@@ -302,13 +364,14 @@ where
 
                 assert_eq!(content_changes.len(), 1);
 
-                self.markdown_server
-                    .send(content_changes.remove(0).text)
-                    .unwrap();
+                let new_doc = content_changes.remove(0).text;
+
+                return Some(new_doc);
             }
             <lsp_notification!("exit")>::METHOD => unreachable!("handled by caller"),
             method => info!("unimplemented notification method: {}", method),
         }
+        None
     }
 
     fn open_preview(&mut self) -> io::Result<()> {
@@ -319,11 +382,102 @@ where
         if let Some((name, args)) = &mut self.settings.browser {
             let mut command = Command::new(name);
             command.args(args);
-            self.markdown_server.open_specific_browser(command)
+            self.markdown_server
+                .lock()
+                .unwrap()
+                .open_specific_browser(command)
         } else {
-            self.markdown_server.open_browser()
+            self.markdown_server.lock().unwrap().open_browser()
         }
     }
+
+    fn stop_deferred_update_thread(&mut self) {
+        if let Some((_, c, t)) = self.defer_control.take() {
+            _ = c.send(DeferEvent::StopThread);
+            _ = t.join();
+        }
+    }
+    /// If `self.settings.defer_updates.is_some()`:
+    /// spawn a second thread which will wait a bit before updating the preview after each change.
+    /// this way, we can update the preview once for multiple changes.
+    /// this fixes the problem where, with large documents, the preview lags very far behind.
+    /// NOTE: If a thread is already running, it is updated instead.
+    /// NOTE: If `self.settings.defer_updates` is `None`, the thread is stopped instead.
+    fn spawn_or_stop_deferred_update_thread(&mut self) {
+        if let Some(defer_updates) = self.settings.defer_updates {
+            fn gen_durations(
+                ms_before_update: u64,
+                ms_between_updates: u64,
+            ) -> (Duration, Duration) {
+                (
+                    Duration::from_millis(ms_before_update),
+                    Duration::from_millis(ms_between_updates.saturating_sub(ms_before_update)),
+                )
+            }
+            if let Some((_, c, _)) = &self.defer_control {
+                c.send(DeferEvent::SetDelays(defer_updates)).unwrap();
+            } else {
+                self.defer_control = if let Some((ms_before_update, ms_between_updates)) =
+                    self.settings.defer_updates
+                {
+                    let current_document = Arc::new(Mutex::new(None));
+                    // used to wake the thread when the document is changed
+                    let (wake_thread, thread_wake) = std::sync::mpsc::channel();
+                    // for the thread
+                    let current_document_t = Arc::clone(&current_document);
+                    let markdown_server = Arc::clone(&self.markdown_server);
+                    let thread = thread::spawn(move || {
+                        let mut delays = gen_durations(ms_before_update, ms_between_updates);
+                        let mut keep_running = true;
+                        while keep_running {
+                            let mut update_preview = false;
+                            fn handle(
+                                e: DeferEvent,
+                                keep_running: &mut bool,
+                                update_preview: &mut bool,
+                                delays: &mut (Duration, Duration),
+                            ) {
+                                match e {
+                                    DeferEvent::StopThread => *keep_running = true,
+                                    DeferEvent::UpdatePreview => *update_preview = true,
+                                    DeferEvent::SetDelays((before, between)) => {
+                                        *delays = gen_durations(before, between)
+                                    }
+                                }
+                            }
+                            match thread_wake.recv() {
+                                Ok(e) => {
+                                    handle(e, &mut keep_running, &mut update_preview, &mut delays)
+                                }
+                                Err(_) => break,
+                            }
+                            if update_preview {
+                                std::thread::sleep(delays.0);
+                                match current_document_t.lock().unwrap().take() {
+                                    Some(new_doc) => {
+                                        markdown_server.lock().unwrap().send(new_doc).unwrap();
+                                    }
+                                    None => {}
+                                }
+                                std::thread::sleep(delays.1);
+                            }
+                        }
+                    });
+                    Some((current_document, wake_thread, thread))
+                } else {
+                    None
+                };
+            }
+        } else {
+            self.stop_deferred_update_thread();
+        }
+    }
+}
+
+enum DeferEvent {
+    StopThread,
+    UpdatePreview,
+    SetDelays((u64, u64)),
 }
 
 fn deserialize_command<'de, D>(deserializer: D) -> Result<(String, Vec<String>), D::Error>
