@@ -35,6 +35,7 @@ Like most language servers, mdpls operates over stdin and stdout.
 | `markdown.preview.codeTheme` | string | [highlight.js style] to use for syntax highlighting in code blocks. | `github`
 | `markdown.preview.serveStatic` | boolean | Serve static files like images (this should only be use with trusted documents) | `false`
 | `markdown.preview.renderer` | array or string | The program to use to render the markdown to html. If not specified, the builtin markdown renderer will be used. | None
+| `markdown.preview.port` | integer | Port to bind the preview webserver on | `32423`
 
 ### Commands
 

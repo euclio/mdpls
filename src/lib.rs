@@ -28,6 +28,9 @@ struct Settings {
     /// Auto-open the preview.
     auto: bool,
 
+    /// Port to serve the webserver on. If `None`, default to 32423
+    port: u16,
+
     /// Program and arguments to use to open the preview. If `None`, use the default browser.
     browser: Option<(String, Vec<String>)>,
 
@@ -45,6 +48,7 @@ impl Default for Settings {
     fn default() -> Settings {
         Settings {
             auto: true,
+            port: 32423,
             browser: None,
             theme: String::from("github"),
             serve_static: false,
@@ -126,9 +130,9 @@ where
     W: Write,
 {
     pub fn new(reader: R, writer: W) -> Self {
-        let server = aurelius::Server::bind("localhost:0").unwrap();
-
         let mut settings = Settings::default();
+
+        let server = aurelius::Server::bind(format!("localhost:{}", settings.port)).unwrap();
 
         // Act as if auto-open wsas previously set to false, so that the preview will open on the
         // first configuration change if auto is set to true.
